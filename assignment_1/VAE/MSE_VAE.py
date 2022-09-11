@@ -129,21 +129,21 @@ if __name__ == '__main__':
     torch.save(model.state_dict(), modelpath)'''
 
     # Generating Latents for learning Prior
-    Z = []
+    '''Z = []
     with tqdm(dataloader) as tepoch:
         for X, _ in tepoch:
             mean, std = model[0](X.to(device))
             z = posteriors(mean, std, 1).squeeze()
             Z.append(z.detach().cpu().numpy())
-    np.save(latentpath, Z, allow_pickle=True)
+    np.save(latentpath, Z, allow_pickle=True)'''
 
     # Learning Priors on Latents using GMM
-    Z = np.load(latentpath, allow_pickle=True)
+    '''Z = np.load(latentpath, allow_pickle=True)
     Z = np.reshape(Z, (len(Z), 23*18))
     gmm = GaussianMixture(n_components=10, verbose=1, verbose_interval=10)
     gmm.fit(Z)
     dump(gmm, open(gmmpath, 'wb'))
-    gmm = load(open(gmmpath, 'rb'))
+    gmm = load(open(gmmpath, 'rb'))'''
 
     # Sampling from gmm
     '''z = gmm.sample()[0]
