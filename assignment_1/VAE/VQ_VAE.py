@@ -1,10 +1,15 @@
 import torch
 from torch import nn
 from torchvision import datasets, transforms
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Subset
 from tqdm import tqdm
+from torch.nn import init
+from torch.utils.tensorboard import SummaryWriter
 
-device = 'cuda:1'
+device = 'cuda:0'
+
+writer = SummaryWriter('/home/adarsh/ADRL/assignment_1/VAE/logs/vqvae_run')
+
 datapath = '/home/adarsh/ADRL/datasets/tiny-imagenet-200/tiny-imagenet-200/train'
 modelpaths = {
     'enc' : '/home/adarsh/ADRL/assignment_1/VAE/vq_vae_enc_2.pt',
@@ -14,120 +19,131 @@ modelpaths = {
 
 class Encoder(nn.Module):
     '''
-    I:64x64 -> Z:4x4
+    I:64x64 -> Z:1x16x16
     '''
     def __init__(self) -> None:
         super(Encoder, self).__init__()
         self.layers = nn.ModuleList([
-            nn.Conv2d(3, 128, 4, 2, 1),
-            nn.BatchNorm2d(128),
-            nn.LeakyReLU(0.2, True),
+            nn.Conv2d(3, 1024, 3, 1, 1),
+            nn.ReLU(True),
             
-            nn.Conv2d(128, 64, 4, 2, 1),
-            nn.BatchNorm2d(64),
-            nn.LeakyReLU(0.2, True),
+            nn.Conv2d(1024, 512, 4, 2, 1),
+            nn.ReLU(True),
 
-            nn.Conv2d(64, 32, 4, 2, 1),
-            nn.BatchNorm2d(32),
-            nn.LeakyReLU(0.2, True),
+            nn.Conv2d(512, 256, 4, 2, 1),
+            nn.ReLU(True),
 
-            nn.Conv2d(32, 1, 4, 2, 1),
-            nn.LeakyReLU(0.2, True),
+            nn.Conv2d(256, 1, 1, 1)
         ])
     
     def forward(self, h):
         [ h:=layer(h) for layer in self.layers]
         return h
 
+
 class Decoder(nn.Module):
     '''
-    Z:4x4 -> I:64x64
+    Z:1x32x32 -> I:3x64x64
     '''
+    filter = 64
     def __init__(self) -> None:
         super(Decoder, self).__init__()
+        filter_size = 128 
+
         self.layers = nn.ModuleList([
-            nn.ConvTranspose2d(1, 512, 4, 2, 1, bias=False),
-            nn.BatchNorm2d(512),
-            nn.LeakyReLU(0.2, True),
+            nn.ConvTranspose2d( 1, filter_size * 8, 1, 1, bias=False), #0
+            nn.ReLU(True), #2
             
-            nn.ConvTranspose2d(512, 256, 4, 2, 1, bias=False),
-            nn.BatchNorm2d(256),
-            nn.LeakyReLU(0.2, True),
+            nn.ConvTranspose2d( filter_size * 8, filter_size * 4, 4, 2, 1, bias=False), #0
+            nn.ReLU(True), #2
 
-            nn.ConvTranspose2d(256, 128, 4, 2, 1, bias=False),
-            nn.BatchNorm2d(128),
-            nn.LeakyReLU(0.2, True),
+            nn.ConvTranspose2d( filter_size * 4, filter_size * 2, 4, 2, 1, bias=False), #0
+            nn.ReLU(True), #2
+            
+            nn.ConvTranspose2d( filter_size * 2, filter_size, 1 , bias=False), #0
+            nn.ReLU(True), #2
 
-            nn.ConvTranspose2d(128, 64, 1, 1, bias=False),
-            nn.BatchNorm2d(64),
-            nn.LeakyReLU(0.2, True),
+            nn.ConvTranspose2d( filter_size, 3, 1, bias=False),
+            nn.Sigmoid() #20
 
-            nn.ConvTranspose2d(64, 3, 4, 2, 1, bias=False),
-            nn.Tanh()
         ])
     
     def forward(self, h):
         [ h:=layer(h) for layer in self.layers]
+
         return h
 
 class Quantizer(nn.Module):
 
-    def __init__(self, codebook=128, shape=(4,4)) -> None:
+    def __init__(self, codebook=128) -> None:
         super(Quantizer, self).__init__()
-        self.embeddings = nn.Embedding(codebook, 1)
-        self.shape = shape
+        self._embedding = nn.Embedding(codebook, 1)
         self.codebook = codebook
+        self._embedding_dim = 1
+        self._num_embeddings = codebook
     
-    def quantize(self, i:torch.Tensor):
-        h = self.embeddings(torch.Tensor([0]).long().to(device))
-        curr =  torch.abs(h - i)
-        for e in self.embeddings(torch.arange(self.codebook).to(device)):
-            if torch.abs(e - i) <= curr:
-                curr = torch.abs(e - i)
-                h = e
-        return h.squeeze()
-    
-    def forward(self, h:torch.Tensor):
-        shape = h.shape
-        h = h.flatten()
-        h = torch.stack([self.quantize(i) for i in h])
-        h = torch.reshape(h, shape)
-        return h
+    def forward(self, inputs:torch.Tensor):
+        
+        inputs = inputs.permute(0, 2, 3, 1).contiguous()
+        input_shape = inputs.shape
+        
+        # Flatten input
+        flat_input = inputs.view(-1, self._embedding_dim)
+        
+        # Calculate distances
+        distances = (torch.sum(flat_input**2, dim=1, keepdim=True) 
+                    + torch.sum(self._embedding.weight**2, dim=1)
+                    - 2 * torch.matmul(flat_input, self._embedding.weight.t()))
+            
+        # Encoding
+        encoding_indices = torch.argmin(distances, dim=1).unsqueeze(1)
+        encodings = torch.zeros(encoding_indices.shape[0], self._num_embeddings, device=inputs.device)
+        encodings.scatter_(1, encoding_indices, 1)
+        
+        # Quantize and unflatten
+        quantized = torch.matmul(encodings, self._embedding.weight).view(input_shape)
+
+        return quantized.permute(0, 3, 1, 2).contiguous()
 
 def encoder_epoch(encoder:Encoder, decoder:Decoder, quantizer:Quantizer, X, beta, optim:torch.optim.Adam):
-    loss = nn.functional.mse_loss(X, decoder(encoder(X))) + beta*torch.norm(quantizer(encoder(X)) - encoder(X))
     optim.zero_grad()
+    loss = nn.functional.binary_cross_entropy(decoder(encoder(X) + (quantizer(encoder(X))-encoder(X)).detach()), X) + beta*torch.nn.functional.mse_loss(quantizer(encoder(X)).detach(), encoder(X))
+    #loss = nn.functional.mse_loss(X, decoder(encoder(X))) 
     loss.backward()
     optim.step()
     return loss.item()
 
 def decoder_epoch(encoder:Encoder, decoder:Decoder, quantizer:Quantizer, X, optim:torch.optim.Adam):
-    loss = nn.functional.mse_loss(X, decoder(quantizer(encoder(X))))
     optim.zero_grad()
+    loss = nn.functional.binary_cross_entropy(decoder(quantizer(encoder(X)).detach()), X)
+    #loss = nn.functional.mse_loss(X, decoder(encoder(X)))
     loss.backward()
     optim.step()
     return loss.item()
 
 def quantizer_epoch(encoder:Encoder, decoder:Decoder, quantizer:Quantizer, X, optim:torch.optim.Adam):
-    loss = torch.norm(quantizer(encoder(X)) - encoder(X))
     optim.zero_grad()
+    loss =  torch.nn.functional.mse_loss(quantizer(encoder(X).detach()), encoder(X).detach())
     loss.backward()
     optim.step()
     return loss.item()
 
 if __name__=='__main__':
 
-    imagenet = datasets.ImageFolder(datapath, transform=transforms.ToTensor())
-    train_dataloader = DataLoader(imagenet, 32, shuffle=True)
+    imagenet_transform = transforms.Compose([transforms.ToTensor()])
 
-    codebook = 128
+    imagenet = datasets.ImageFolder(datapath, transform=imagenet_transform)
+    train_dataloader = DataLoader(imagenet, 16, shuffle=True)
 
     models = {
         'enc' : Encoder().to(device),
         'dec' : Decoder().to(device),
-        'quan' : Quantizer(codebook).to(device)
+        'quan' : Quantizer(512//2).to(device)
     }
-    [ models[key].load_state_dict(torch.load(modelpaths[key])) for key in modelpaths.keys()]
+    # try:
+    #     [ models[key].load_state_dict(torch.load(modelpaths[key])) for key in modelpaths.keys()]
+    # except:
+    #     print('incorrect modelpaths')
     optimizers = {
         'enc' : torch.optim.Adam(models['enc'].parameters()),
         'dec' : torch.optim.Adam(models['dec'].parameters()),
@@ -135,13 +151,82 @@ if __name__=='__main__':
     }
 
     # Training Code
-    for ep in range(1):
+    for ep in range(2):
         with tqdm(train_dataloader) as tepoch:
             tepoch.set_description(f'Epoch {ep+1} : ')
+            i=0
             for X, _ in tepoch:
-                quan_loss = quantizer_epoch(models['enc'], models['dec'], models['quan'], X.to(device), optimizers['quan'])
                 enc_loss = encoder_epoch(models['enc'], models['dec'], models['quan'], X.to(device), 0.25, optimizers['enc'])
                 dec_loss = decoder_epoch(models['enc'], models['dec'], models['quan'], X.to(device), optimizers['dec'])
+                quan_loss = quantizer_epoch(models['enc'], models['dec'], models['quan'], X.to(device), optimizers['quan'])
+                #tepoch.set_postfix({'loss': (enc_loss, dec_loss)})
                 tepoch.set_postfix({'loss': (enc_loss, dec_loss, quan_loss)})
                 tepoch.refresh()
+                writer.add_scalars(f'Errors_{ep}',{
+                    'encoder loss':enc_loss,
+                    'decoder_loss':dec_loss,
+                    'quantizer_loss':quan_loss,
+                },
+                    global_step=i
+                )
+                i+=1
                 [ torch.save(models[key].state_dict(), modelpaths[key]) for key in modelpaths.keys() ]
+
+
+'''
+VAE for Latent Space
+'''
+class ZEncoder(nn.Module):
+    '''
+    Z : 256 -> 64
+    '''
+    def __init__(self) -> None:
+        super(ZEncoder, self).__init__()
+        self.seq = nn.Sequential(
+            nn.Linear(256, 128),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Linear(128, 64),
+            nn.LeakyReLU(0.2, inplace=True)
+        )
+        self.mean = nn.Linear(64, 64)
+        self.std = nn.Linear(64, 64)
+    
+    def forward(self, z):
+        z = self.seq(z)
+        return torch.tanh(self.mean(z)), torch.exp(self.std(z))
+
+def sample(mean, std):
+    return mean + std*torch.randn(mean.shape).to(device)
+
+class ZDecoder(nn.Module):
+    '''
+    Z : 64 -> 256
+    '''
+    def __init__(self) -> None:
+        super(ZDecoder, self).__init__()
+        self.seq = nn.Sequential(
+            nn.Linear(64, 128),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Linear(128, 256),
+        )
+    
+    def forward(self, z):
+        return self.seq(z)
+
+def zepoch(X, beta, gamma, loss_func, model, optim):
+    X = X.to(device)
+    mean, std = model[0](X)
+    z = sample(mean, std)
+    Y = model[1](z)
+    Y = sample(Y, gamma).squeeze()
+    loss = loss_func(X.squeeze(), Y) - beta*0.5*(1+2*torch.log(std.flatten())-torch.square(mean.flatten())-torch.square(std.flatten())).mean()
+
+    optim.zero_grad()
+    loss.backward()
+    optim.step()
+
+    return loss, z
+
+zmodelpath  = '/home/adarsh/ADRL/assignment_1/VAE/vq_z_vae_model.pt'
+zmodel = nn.Sequential(ZEncoder(), ZDecoder()).to(device)
+zoptim = torch.optim.Adam(zmodel.parameters())
